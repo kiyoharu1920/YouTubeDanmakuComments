@@ -18,28 +18,42 @@
   const STORE_KEY = "ytdm-settings";
 
   /**
-   * 設定パネルの1項目。最小値・最大値・刻み幅は数値入力とスライダーで使う。
-   * @typedef {[key: string, label: string, type: "checkbox" | "number" | "range" | "color" | "text", defaultValue: string | number | boolean, min?: number, max?: number, step?: number]} SettingField
+   * @typedef {object} SettingField
+   * @property {string} label 設定パネルの表示名。
+   * @property {"checkbox" | "number" | "range" | "color" | "text"} type 入力欄の種類。
+   * @property {string | number | boolean} defaultValue 初期値。
+   * @property {number} [min] 数値入力とスライダーの最小値。
+   * @property {number} [max] 数値入力とスライダーの最大値。
+   * @property {number} [step] 数値入力とスライダーの刻み幅。
    */
 
-  /** @type {SettingField[]} */
-  const FIELDS = [
-    ["enabled", "コメントを流す", "checkbox", true],
-    ["fontSize", "文字サイズ (画面の高さに対する%)", "number", 5.5, 1, 20, 0.5],
-    ["opacity", "不透明度", "range", 0.9, 0.1, 1, 0.05],
-    ["color", "文字色", "color", "#ffffff"],
-    ["strokeColor", "縁取りの色", "color", "#000000"],
-    ["strokeWidth", "縁取りの太さ (px)", "number", 1, 0, 5, 0.5],
-    ["bold", "太字", "checkbox", true],
-    ["fontFamily", "フォント", "text", '"Hiragino Kaku Gothic ProN", "Meiryo", sans-serif'],
-    ["duration", "画面を横切る秒数", "number", 5, 1, 20, 0.5],
-    ["area", "表示範囲 (上から何%)", "number", 100, 10, 100, 5],
-    ["maxChars", "1コメントの最大文字数", "number", 80, 5, 500, 5],
-    ["maxComments", "取得するコメント数 (次の動画から反映)", "number", 500, 20, 5000, 20],
-    ["replies", "タイムスタンプ付きコメントの返信も流す (次の動画から反映)", "checkbox", true],
-    ["maxReplies", "1コメントあたりの返信の上限 (次の動画から反映)", "number", 20, 1, 200, 1],
-  ];
-  const DEFAULTS = Object.fromEntries(FIELDS.map(([k, , , d]) => [k, d]));
+  /** @type {Record<string, SettingField>} */
+  const FIELDS = {
+    enabled: { label: "コメントを流す", type: "checkbox", defaultValue: true },
+    fontSize: { label: "文字サイズ (画面の高さに対する%)", type: "number", defaultValue: 5.5, min: 1, max: 20, step: 0.5 },
+    opacity: { label: "不透明度", type: "range", defaultValue: 0.9, min: 0.1, max: 1, step: 0.05 },
+    color: { label: "文字色", type: "color", defaultValue: "#ffffff" },
+    strokeColor: { label: "縁取りの色", type: "color", defaultValue: "#000000" },
+    strokeWidth: { label: "縁取りの太さ (px)", type: "number", defaultValue: 1, min: 0, max: 5, step: 0.5 },
+    bold: { label: "太字", type: "checkbox", defaultValue: true },
+    fontFamily: { label: "フォント", type: "text", defaultValue: '"Hiragino Kaku Gothic ProN", "Meiryo", sans-serif' },
+    duration: { label: "画面を横切る秒数", type: "number", defaultValue: 5, min: 1, max: 20, step: 0.5 },
+    area: { label: "表示範囲 (上から何%)", type: "number", defaultValue: 100, min: 10, max: 100, step: 5 },
+    maxChars: { label: "1コメントの最大文字数", type: "number", defaultValue: 80, min: 5, max: 500, step: 5 },
+    maxComments: { label: "取得するコメント数 (次の動画から反映)", type: "number", defaultValue: 500, min: 20, max: 5000, step: 20 },
+    replies: { label: "タイムスタンプ付きコメントの返信も流す (次の動画から反映)", type: "checkbox", defaultValue: true },
+    maxReplies: { label: "1コメントあたりの返信の上限 (次の動画から反映)", type: "number", defaultValue: 20, min: 1, max: 200, step: 1 },
+  };
+  const DEFAULTS = Object.fromEntries(Object.entries(FIELDS).map(([key, { defaultValue }]) => [key, defaultValue]));
+
+  /**
+   * 数値設定を許容範囲に収める。
+   * @param {number} value 設定値。
+   * @param {number} min 最小値。
+   * @param {number} max 最大値。
+   * @returns {number} 許容範囲内の値。
+   */
+  const clampSettingNumber = (value, min, max) => Math.min(max, Math.max(min, value));
 
   /**
    * 保存済みの設定を読み込み、既定値と許容範囲に従って正規化する。
@@ -51,12 +65,12 @@
       saved = JSON.parse(localStorage.getItem(STORE_KEY)) ?? {};
     } catch {}
     const s = {};
-    for (const [k, , type, d, min, max] of FIELDS) {
-      const v = saved[k];
-      if (type === "checkbox") s[k] = typeof v === "boolean" ? v : d;
-      else if (type === "number" || type === "range") s[k] = Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : d;
-      else if (type === "color") s[k] = /^#[0-9a-f]{6}$/i.test(v) ? v : d;
-      else s[k] = typeof v === "string" && v.trim() ? v : d;
+    for (const [key, { type, defaultValue, min, max }] of Object.entries(FIELDS)) {
+      const value = saved[key];
+      if (type === "checkbox") s[key] = typeof value === "boolean" ? value : defaultValue;
+      else if (type === "number" || type === "range") s[key] = Number.isFinite(value) ? clampSettingNumber(value, min, max) : defaultValue;
+      else if (type === "color") s[key] = /^#[0-9a-f]{6}$/i.test(value) ? value : defaultValue;
+      else s[key] = typeof value === "string" && value.trim() ? value : defaultValue;
     }
     return s;
   }
@@ -496,28 +510,29 @@
 
     const inputs = {};
     const sync = () => {
-      for (const [k, , type] of FIELDS) {
-        if (type === "checkbox") inputs[k].checked = S[k];
-        else inputs[k].value = S[k];
+      for (const [key, { type }] of Object.entries(FIELDS)) {
+        if (type === "checkbox") inputs[key].checked = S[key];
+        else inputs[key].value = S[key];
       }
     };
-    for (const [k, label, type, , min, max, step] of FIELDS) {
+    for (const [key, { label, type, defaultValue, min, max, step }] of Object.entries(FIELDS)) {
       const row = document.createElement("label");
       const span = document.createElement("span");
       span.textContent = label;
       const input = document.createElement("input");
       input.type = type;
+      input.name = key;
       if (min !== undefined) Object.assign(input, { min, max, step });
       input.addEventListener(type === "checkbox" ? "change" : "input", () => {
-        if (type === "checkbox") S[k] = input.checked;
+        if (type === "checkbox") S[key] = input.checked;
         else if (type === "number" || type === "range") {
           const n = parseFloat(input.value);
           if (!Number.isFinite(n)) return; // 入力途中の空欄などは無視
-          S[k] = Math.min(max, Math.max(min, n));
-        } else S[k] = input.value.trim() || DEFAULTS[k];
+          S[key] = clampSettingNumber(n, min, max);
+        } else S[key] = input.value.trim() || defaultValue;
         onSettingsChanged();
       });
-      inputs[k] = input;
+      inputs[key] = input;
       row.append(span, input);
       panel.append(row);
     }
@@ -590,7 +605,7 @@
     btn.append(svg);
     btn.addEventListener("click", () => {
       S.enabled = !S.enabled;
-      panel.querySelector("input[type=checkbox]").checked = S.enabled; // 先頭は enabled
+      panel.querySelector("input[name=enabled]").checked = S.enabled;
       onSettingsChanged();
     });
     btn.addEventListener("contextmenu", (e) => {

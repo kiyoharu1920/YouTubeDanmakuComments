@@ -7,13 +7,22 @@
 // @grant        none
 // ==/UserScript==
 
+/**
+ * @file YouTubeの動画コメントを取得し、再生時刻に合わせて弾幕として表示する。
+ */
+
 (() => {
   "use strict";
 
   const REPLY_GAP = 0.5; // 返信を親コメントの何秒後から順に流すか
   const STORE_KEY = "ytdm-settings";
 
-  // 設定項目: [キー, 表示名, 種類, 初期値, 最小, 最大, 刻み]
+  /**
+   * 設定パネルの1項目。最小値・最大値・刻み幅は数値入力とスライダーで使う。
+   * @typedef {[key: string, label: string, type: "checkbox" | "number" | "range" | "color" | "text", defaultValue: string | number | boolean, min?: number, max?: number, step?: number]} SettingField
+   */
+
+  /** @type {SettingField[]} */
   const FIELDS = [
     ["enabled", "コメントを流す", "checkbox", true],
     ["fontSize", "文字サイズ (画面の高さに対する%)", "number", 5.5, 1, 20, 0.5],
@@ -32,7 +41,10 @@
   ];
   const DEFAULTS = Object.fromEntries(FIELDS.map(([k, , , d]) => [k, d]));
 
-  // localStorage の値は信用せず、型と範囲を揃えてから使う
+  /**
+   * 保存済みの設定を読み込み、既定値と許容範囲に従って正規化する。
+   * @returns {Record<string, any>} 設定項目のキーと正規化済みの値。
+   */
   function loadSettings() {
     let saved = {};
     try {
@@ -49,6 +61,7 @@
     return s;
   }
   let S = loadSettings();
+  /** 現在の設定をYouTubeオリジンのローカルストレージに保存する。 */
   const saveSettings = () => localStorage.setItem(STORE_KEY, JSON.stringify(S));
 
   // 1:23 / 12:34 / 1:02:03 形式。数字や「数字:」の続きになっているものは除外 (「4:52:」の後ろのコロンは可)
@@ -77,22 +90,62 @@
   `;
   document.head.append(style);
 
-  let comments = []; // {id, text, replies: [text]}
-  let schedule = []; // {t, text} を t 昇順
+  /**
+   * @typedef {object} CommentEntry
+   * @property {string | undefined} id YouTubeのコメントID。
+   * @property {string} text コメント本文。
+   * @property {number} replyLevel 親コメントは0、返信は正の値。
+   */
+
+  /**
+   * @typedef {object} CommentPage
+   * @property {CommentEntry[]} entries 取得したページ内のコメントまたは返信。
+   * @property {Map<string, string>} replyTokens 親コメントIDごとの返信取得トークン。
+   * @property {string | undefined} next 次のページの取得トークン。
+   */
+
+  /**
+   * @typedef {object} VideoComment
+   * @property {string | undefined} id YouTubeの親コメントID。
+   * @property {string} text 親コメントの本文。
+   * @property {string[]} replies 取得順に並んだ返信の本文。
+   */
+
+  /**
+   * @typedef {object} TimedComment
+   * @property {number} t 表示開始時刻（動画の先頭からの秒数）。
+   * @property {string} text 表示する本文。
+   */
+
+  /** @type {VideoComment[]} */
+  let comments = [];
+  /** @type {TimedComment[]} 表示開始時刻の昇順。 */
+  let schedule = [];
   let cursor = 0; // 次に流す schedule の位置
   let lastT = 0;
   let layoutKey = "";
-  let active = []; // 表示中 {el, t0, w}
-  let lanes = []; // 行ごとの直近コメント {t0, w, v}
+  /** @type {{el: HTMLDivElement, t0: number, w: number}[]} 表示中の要素と開始時刻（秒）、幅（px）。 */
+  let active = [];
+  /** @type {{t0: number, w: number, v: number}[]} 行ごとの直近コメントの開始時刻（秒）、幅（px）、速度（px/秒）。 */
+  let lanes = [];
   let loadGen = 0;
   let frameNo = 0;
 
+  /** 現在のYouTubeプレイヤーを探す。 */
   const player = () => document.querySelector("#movie_player");
+  /** プレイヤー内の動画要素を探す。 */
   const video = () => document.querySelector("#movie_player video");
+  /** プレイヤー内の弾幕レイヤーを探す。 */
   const layer = () => document.querySelector("#movie_player .ytdm-layer");
 
   // ---- コメント取得 (YouTubeのページ自身が使う innertube API) ----
 
+  /**
+   * YouTubeのページが使うInnertubeの next エンドポイントへリクエストを送る。
+   * @param {{videoId: string} | {continuation: string}} body 動画IDまたは継続取得トークン。
+   * @returns {Promise<Record<string, any>>} YouTubeから返されたJSON。
+   * @throws {Error} HTTPレスポンスが成功ステータスでない場合。
+   */
   async function innertube(body) {
     const context = window.ytcfg?.get?.("INNERTUBE_CONTEXT") ?? {
       client: { clientName: "WEB", clientVersion: "2.20261001.00.00", hl: "ja", gl: "JP" },
@@ -108,17 +161,31 @@
     return res.json();
   }
 
+  /**
+   * JSONのオブジェクトと配列を深さ優先でたどる。
+   * @param {unknown} o 探索の起点。
+   * @yields {Record<string, any>} 探索中のオブジェクトまたは配列。
+   */
   function* walk(o) {
     if (!o || typeof o !== "object") return;
     yield o;
     for (const v of Object.values(o)) yield* walk(v);
   }
 
+  /**
+   * JSON内で最初に見つかった継続取得トークンを返す。
+   * @param {unknown} o 探索の起点。
+   * @returns {string | undefined} 見つかったトークン。
+   */
   const findToken = (o) => {
     for (const x of walk(o)) if (x.continuationCommand?.token) return x.continuationCommand.token;
   };
 
-  // 1ページ分: 本文 {id, text, replyLevel} と、次ページのトークン、各スレッドの返信トークン
+  /**
+   * 継続取得トークンからコメントまたは返信を1ページ取得する。
+   * @param {string} token 取得するページを示すトークン。
+   * @returns {Promise<CommentPage>} コメント本文と継続取得用のトークン。
+   */
   async function fetchPage(token) {
     const data = await innertube({ continuation: token });
     const items = (data.onResponseReceivedEndpoints ?? []).flatMap((e) => (e.reloadContinuationItemsCommand ?? e.appendContinuationItemsAction)?.continuationItems ?? []);
@@ -144,6 +211,12 @@
     return { entries, replyTokens, next: findToken(items.findLast((i) => i.continuationItemRenderer)) };
   }
 
+  /**
+   * 親コメントを取得し、設定に応じてタイムスタンプ付きコメントの返信を追加する。
+   * @param {string} videoId YouTubeの動画ID。
+   * @yields {VideoComment[]} ページ取得ごとに更新される同一のコメント配列。
+   * @throws {Error} コメント欄の最初の取得トークンが見つからない場合。
+   */
   async function* fetchComments(videoId) {
     const opts = { ...S }; // 読み込み中の設定変更は次の動画から
     const first = await innertube({ videoId });
@@ -183,19 +256,37 @@
 
   // ---- 表示時刻の決定 ----
 
+  /**
+   * コメント本文を、タイムスタンプのないコメントの配置に使う値へ変換する。
+   * @param {string} s ハッシュ化する本文。
+   * @returns {number} 0以上1未満の値。
+   */
   const hash = (s) => {
     let h = 2166136261;
     for (const c of s) h = Math.imul(h ^ c.codePointAt(0), 16777619);
     return (h >>> 0) / 2 ** 32;
   };
 
+  /**
+   * タイムスタンプの時・分・秒を通算秒へ変換する。
+   * @param {RegExpMatchArray} m タイムスタンプのマッチ結果。
+   * @returns {number} 動画の先頭からの秒数。
+   */
   const toSec = (m) => (+m[1] || 0) * 3600 + +m[2] * 60 + +m[3];
   const TS_RE_G = new RegExp(TS_RE.source, "g");
-  // 区切りの前後に残る空白・改行・「〜」「-」「:」などを落とす
+  /**
+   * 本文の前後の区切り記号を落とし、本文中の連続する空白をまとめる。
+   * @param {string} s 整形する本文。
+   * @returns {string} 整形後の本文。
+   */
   const tidy = (s) => s.replace(/^[\s~〜\-–—:：、,，・|｜/]+|[\s~〜\-–—:：、,，・|｜/@＠]+$/g, "").replace(/\s+/g, " ");
 
-  // タイムスタンプで本文を区切り、時刻ごとの文 [{t, text}] にする (タイムスタンプ部分は除去)。
-  // 「0:30ここすき」「0:30\nここすき」「ここすき 0:30」「0:30〜1:20 ここ」のどれでも対応する
+  /**
+   * 本文をタイムスタンプごとに分割し、時刻とその時刻に表示する本文を取り出す。
+   * 時刻の前後にある本文や、「0:30〜1:20 ここ」のような範囲指定にも対応する。
+   * @param {string} text コメントの原文。
+   * @returns {TimedComment[]} タイムスタンプの出現順の結果。時刻がなければ空配列。
+   */
   function splitByStamps(text) {
     const ms = [...text.matchAll(TS_RE_G)];
     if (!ms.length) return [];
@@ -217,6 +308,13 @@
     }));
   }
 
+  /**
+   * 親コメントと返信の表示時刻を決め、動画内で表示できる本文を時刻順に並べる。
+   * @param {VideoComment[]} list 取得した親コメントと返信。
+   * @param {number} duration 動画の長さ（秒）。
+   * @param opts 表示設定。横切る時間（duration、秒）と本文の最大文字数（maxChars）を使う。
+   * @returns {TimedComment[]} 表示開始時刻の昇順のスケジュール。
+   */
   function buildSchedule(list, duration, opts) {
     const clip = (s) => {
       s = s.replace(/\s+/g, " ").trim();
@@ -238,6 +336,11 @@
     return out.filter((x) => x.t <= duration && x.text).sort((a, b) => a.t - b.t);
   }
 
+  /**
+   * スケジュールから、指定時刻を超える最初の表示位置を二分探索する。
+   * @param {number} t 比較する再生時刻（秒）。
+   * @returns {number} 該当する添字。該当がなければスケジュールの長さ。
+   */
   const lowerBound = (t) => {
     let lo = 0;
     let hi = schedule.length;
@@ -246,9 +349,10 @@
       if (schedule[mid].t <= t) lo = mid + 1;
       else hi = mid;
     }
-    return lo; // t より後の最初の位置
+    return lo;
   };
 
+  /** 現在の動画と設定で表示スケジュールを再構築し、次の表示位置を更新する。 */
   function rebuild() {
     const v = video();
     if (!v || player()?.classList.contains("ad-showing")) return;
@@ -259,6 +363,7 @@
 
   // ---- 描画 ----
 
+  /** 弾幕レイヤーに文字の表示設定を反映し、次のフレームで再配置する。 */
   function applyStyle() {
     const box = layer();
     if (!box) return;
@@ -279,18 +384,30 @@
     layoutKey = ""; // 次のフレームで配置し直す
   }
 
+  /** 表示中の弾幕を取り除き、行の使用状況を初期化する。 */
   function clear() {
     for (const a of active) a.el.remove();
     active = [];
     lanes = [];
   }
 
-  // シーク・リサイズ・設定変更時: 画面を作り直し、今まさに流れているはずのコメントから再開
+  /**
+   * シークやリサイズ後に、指定時刻で画面上に残る弾幕から表示し直す。
+   * @param {number} now 現在の再生時刻（秒）。
+   */
   function reset(now) {
     clear();
     cursor = lowerBound(now - S.duration);
   }
 
+  /**
+   * 弾幕の表示要素を作成し、先行コメントとの重なりを考慮して行を選ぶ。
+   * @param {TimedComment} c 表示するコメント。
+   * @param {Element} box 弾幕を追加するレイヤー。
+   * @param {number} W 弾幕レイヤーの幅（px）。
+   * @param {number} laneH 1行の高さ（px）。
+   * @param {number} nLanes 利用できる行数。
+   */
   function emit(c, box, W, laneH, nLanes) {
     const el = document.createElement("div");
     el.className = "ytdm-c";
@@ -307,6 +424,7 @@
     active.push({ el, t0: c.t, w });
   }
 
+  /** 再生時刻に合わせて弾幕を追加・移動・削除し、次の描画を予約する。 */
   function frame() {
     requestAnimationFrame(frame);
     if (++frameNo % 60 === 0) setupPlayer(); // コントロールが作り直された場合にボタンを戻す
@@ -352,6 +470,7 @@
 
   // ---- 設定パネル・ボタン ----
 
+  /** 設定を保存し、弾幕ボタンと表示に反映する。 */
   function onSettingsChanged() {
     saveSettings();
     document.querySelectorAll(".ytdm-btn").forEach((b) => b.setAttribute("aria-pressed", String(S.enabled)));
@@ -359,6 +478,10 @@
     rebuild();
   }
 
+  /**
+   * 入力欄と初期化・閉じるボタンを備えた設定パネルを作成する。
+   * @returns {HTMLDivElement} 初期状態では非表示の設定パネル。
+   */
   function buildPanel() {
     const panel = document.createElement("div");
     panel.className = "ytdm-panel";
@@ -417,6 +540,11 @@
     return panel;
   }
 
+  /**
+   * 左クリックで弾幕、右クリックで設定パネルを切り替えるボタンを作成する。
+   * @param panel ボタンから開閉する設定パネル。
+   * @returns {HTMLButtonElement} プレイヤーの操作欄に追加するボタン。
+   */
   function buildButton(panel) {
     const btn = document.createElement("button");
     btn.className = "ytp-button ytdm-btn";
@@ -473,6 +601,10 @@
     return btn;
   }
 
+  /**
+   * 現在のプレイヤーに弾幕レイヤー、設定パネル、操作ボタンを取り付ける。
+   * @returns {boolean} プレイヤーが見つかったかどうか。
+   */
   function setupPlayer() {
     const p = player();
     if (!p) return false;
@@ -488,6 +620,7 @@
     return true;
   }
 
+  /** 動画切り替え時に前の弾幕を消し、現在の動画のコメントを順次読み込む。 */
   async function load() {
     const gen = ++loadGen;
     comments = [];

@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         YouTube Danmaku Comments
-// @version      1.0.0
+// @version      1.0.1
 // @description  YouTube動画のコメント欄のコメントを、ニコニコ動画風に動画上へ流す。タイムスタンプ付きコメントはその時刻に、その返信は直後に表示する。
 // @match        https://www.youtube.com/*
 // @run-at       document-idle
@@ -30,6 +30,7 @@
   /** @type {Record<string, SettingField>} */
   const FIELDS = {
     enabled: { label: "コメントを流す", type: "checkbox", defaultValue: true },
+    matchCaptions: { label: "字幕・文字起こしに合わせて流す（試験）", type: "checkbox", defaultValue: false },
     fontSize: { label: "文字サイズ (画面の高さに対する%)", type: "number", defaultValue: 5.5, min: 1, max: 20, step: 0.5 },
     opacity: { label: "不透明度", type: "range", defaultValue: 0.9, min: 0.1, max: 1, step: 0.05 },
     color: { label: "文字色", type: "color", defaultValue: "#ffffff" },
@@ -144,6 +145,7 @@
   let lanes = [];
   let loadGen = 0;
   let frameNo = 0;
+  let captionState = null;
 
   /** 現在のYouTubeプレイヤーを探す。 */
   const player = () => document.querySelector("#movie_player");
@@ -155,23 +157,26 @@
   // ---- コメント取得 (YouTubeのページ自身が使う innertube API) ----
 
   /**
-   * YouTubeのページが使うInnertubeの next エンドポイントへリクエストを送る。
-   * @param {{videoId: string} | {continuation: string}} body 動画IDまたは継続取得トークン。
+   * YouTubeのページが使うInnertubeへリクエストを送る。
+   * @param {Record<string, string>} body エンドポイントに渡す値。
+   * @param {string} [endpoint] 取得先のエンドポイント。
+   * @param {AbortSignal} [signal] リクエストの中断シグナル。
    * @returns {Promise<Record<string, any>>} YouTubeから返されたJSON。
    * @throws {Error} HTTPレスポンスが成功ステータスでない場合。
    */
-  async function innertube(body) {
+  async function innertube(body, endpoint = "next", signal) {
     const context = window.ytcfg?.get?.("INNERTUBE_CONTEXT") ?? {
       client: { clientName: "WEB", clientVersion: "2.20261001.00.00", hl: "ja", gl: "JP" },
     };
-    // 公開コメントの読み取りだけなので Cookie は送らない
-    const res = await fetch("/youtubei/v1/next?prettyPrint=false", {
+    // 公開コメント・文字起こしの読み取りだけなので Cookie は送らない
+    const res = await fetch(`/youtubei/v1/${endpoint}?prettyPrint=false`, {
       method: "POST",
       credentials: "omit",
+      signal,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ context, ...body }),
     });
-    if (!res.ok) throw new Error(`youtubei/v1/next ${res.status}`);
+    if (!res.ok) throw new Error(`youtubei/v1/${endpoint} ${res.status}`);
     return res.json();
   }
 
@@ -227,13 +232,13 @@
 
   /**
    * 親コメントを取得し、設定に応じてタイムスタンプ付きコメントの返信を追加する。
-   * @param {string} videoId YouTubeの動画ID。
+   * @param {Promise<Record<string, any>>} watchData 動画の初回レスポンス。
    * @yields {VideoComment[]} ページ取得ごとに更新される同一のコメント配列。
    * @throws {Error} コメント欄の最初の取得トークンが見つからない場合。
    */
-  async function* fetchComments(videoId) {
+  async function* fetchComments(watchData) {
     const opts = { ...S }; // 読み込み中の設定変更は次の動画から
-    const first = await innertube({ videoId });
+    const first = await watchData;
     let token;
     for (const x of walk(first)) {
       if (x.sectionIdentifier === "comment-item-section") {
@@ -266,6 +271,280 @@
         rt = page.next;
       }
     }
+  }
+
+  // ---- 字幕・文字起こしの取得 ----
+
+  function captionCue(t, text) {
+    return Number.isFinite(t) && t >= 0 && typeof text === "string" && text.trim()
+      ? [{ t, text: text.trim() }]
+      : [];
+  }
+
+  function readTranscriptPanel(id) {
+    const watch = document.querySelector("ytd-watch-flexy:not([hidden])");
+    if (watch?.getAttribute("video-id") !== id) return [];
+    const rows = watch.querySelectorAll("ytd-transcript-segment-renderer, transcript-segment-view-model");
+    return [...rows].flatMap((row) => {
+      const time = row.querySelector(".segment-timestamp, .ytwTranscriptSegmentViewModelTimestamp");
+      const stamp = time?.textContent.trim().match(TS_RE);
+      const text = row.querySelector('.segment-text, span[role="text"]')?.textContent;
+      return captionCue(stamp ? toSec(stamp) : NaN, text);
+    });
+  }
+
+  function parseTranscript(data) {
+    const cues = [];
+    for (const node of walk(data)) {
+      const segment = node.transcriptSegmentRenderer ?? node.transcriptCueRenderer;
+      if (segment) {
+        const snippet = segment.snippet ?? segment.cue;
+        const text = snippet?.simpleText ?? snippet?.runs?.map((run) => run.text).join("");
+        const ms = segment.startMs ?? segment.startOffsetMs;
+        cues.push(...captionCue(ms == null ? NaN : Number(ms) / 1000, text));
+      }
+      const modern = node.transcriptSegmentViewModel;
+      const stamp = typeof modern?.timestamp === "string" && modern.timestamp.match(TS_RE);
+      if (stamp) cues.push(...captionCue(toSec(stamp), modern.simpleText));
+    }
+    return cues;
+  }
+
+  async function fetchCaptionTrack(id, signal) {
+    const response = [player()?.getPlayerResponse?.(), window.ytInitialPlayerResponse]
+      .find((candidate) => candidate?.videoDetails?.videoId === id && candidate.captions);
+    const tracks = response?.captions.playerCaptionsTracklistRenderer?.captionTracks ?? [];
+    const lang = (document.documentElement.lang || navigator.language).split("-")[0];
+    const track = tracks.find((item) => item.languageCode?.split("-")[0] === lang)
+      ?? tracks.find((item) => item.kind !== "asr") ?? tracks[0];
+    if (!track?.baseUrl) return [];
+    const url = new URL(track.baseUrl, location.origin);
+    if (url.origin !== location.origin || url.pathname !== "/api/timedtext") return [];
+    url.searchParams.set("fmt", "json3");
+    const res = await fetch(url, { credentials: "omit", redirect: "error", signal });
+    if (!res.ok) throw new Error(`字幕の取得に失敗 (${res.status})`);
+    const data = await res.json();
+    return (data.events ?? []).flatMap((event) =>
+      captionCue(event.tStartMs / 1000, event.segs?.map((seg) => seg.utf8 ?? "").join("")));
+  }
+
+  async function fetchCaptionCues(state, signal) {
+    try {
+      const cues = await fetchCaptionTrack(state.id, AbortSignal.any([signal, AbortSignal.timeout(5000)]));
+      if (cues.length) return cues;
+    } catch {
+      signal.throwIfAborted();
+      // 字幕トラックを取得できない場合は文字起こしを試す
+    }
+    if (/^[A-Za-z0-9_-]{11}$/.test(state.id)) {
+      try {
+        // get_panel の params は protobuf の field 149 に動画 ID と種類 2 を格納する
+        const params = btoa(String.fromCharCode(0xaa, 0x09, 15, 0x0a, 11) + state.id + String.fromCharCode(0x18, 2));
+        const timeout = AbortSignal.any([signal, AbortSignal.timeout(5000)]);
+        const data = await innertube({ panelId: "PAmodern_transcript_view", params }, "get_panel", timeout);
+        const cues = parseTranscript(data);
+        if (cues.length) return cues;
+      } catch {
+        signal.throwIfAborted();
+        // 現行パネルが取れない場合は、旧形式の文字起こしを確認する
+      }
+    }
+    const data = await state.watchData;
+    signal.throwIfAborted();
+    const panels = data.engagementPanels ?? [];
+    for (const panel of panels) {
+      const renderer = panel.engagementPanelSectionListRenderer;
+      if (!renderer?.targetId?.includes("transcript")) continue;
+      const cues = parseTranscript(renderer.content);
+      if (cues.length) return cues;
+      for (const node of walk(renderer.content)) {
+        const params = node.getTranscriptEndpoint?.params;
+        if (typeof params !== "string" || !params) continue;
+        const result = await innertube({ params }, "get_transcript", AbortSignal.any([signal, AbortSignal.timeout(5000)]));
+        return parseTranscript(result);
+      }
+    }
+    return [];
+  }
+
+  // ---- 字幕とコメントのベクトル照合 ----
+
+  const COMMON_WORDS = new Set((
+    "the a an is are was to of in on and or it this that there you i we be so for at with as " +
+    "の に は が を で と も へ から まで て た だ です ます する いる ある なる れる こと もの " +
+    "これ それ あれ ここ そこ そう こう なん 何 さん ね よ な か ぞ う ん w www 笑"
+  ).split(" "));
+
+  function wordsOf(text, segmenter) {
+    const normalized = text.slice(0, 1000).normalize("NFKC").toLowerCase();
+    return new Set(Array.from(segmenter.segment(normalized))
+      .filter(({ segment, isWordLike }) => isWordLike && /\p{L}/u.test(segment) && !COMMON_WORDS.has(segment))
+      .map(({ segment }) => segment));
+  }
+
+  // まとまった連続処理を小分けにし、再生と設定操作に制御を戻す
+  async function* inBatches(items, signal) {
+    signal.throwIfAborted();
+    let deadline = performance.now() + 8;
+    for (const item of items) {
+      if (performance.now() >= deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        signal.throwIfAborted();
+        deadline = performance.now() + 8;
+      }
+      yield item;
+    }
+  }
+
+  async function buildCaptionIndex(cues, signal) {
+    const segmenter = new Intl.Segmenter(undefined, { granularity: "word" });
+    const terms = new Map();
+    let size = 0;
+    let window;
+    let windowWords;
+    for await (const cue of inBatches(cues.sort((a, b) => a.t - b.t), signal)) {
+      const words = wordsOf(cue.text, segmenter);
+      if (!words.size) continue;
+      if (!window || cue.t - window.t >= 8) {
+        window = { t: cue.t, normSq: 0 };
+        windowWords = new Set();
+        size++;
+      }
+      for (const word of words) {
+        if (windowWords.has(word)) continue;
+        windowWords.add(word);
+        if (!terms.has(word)) terms.set(word, { hits: [], weight: 0 });
+        terms.get(word).hits.push({ window, t: cue.t });
+      }
+    }
+    // 各単語の有無をベクトルの成分にし、出現する区間が少ない単語を重くする
+    for await (const term of inBatches(terms.values(), signal)) {
+      if (term.hits.length > Math.max(4, size * 0.2)) continue;
+      term.weight = 1 + Math.log((size + 1) / (term.hits.length + 1));
+      for (const { window } of term.hits) window.normSq += term.weight ** 2;
+    }
+    return { segmenter, terms, size };
+  }
+
+  function matchCaption(text, { segmenter, terms, size }) {
+    const words = wordsOf(text, segmenter);
+    const scores = new Map();
+    let normSq = 0;
+    for (const word of words) {
+      const term = terms.get(word);
+      if (!term) {
+        normSq += (1 + Math.log1p(size) / 2) ** 2;
+        continue;
+      }
+      if (!term.weight) continue;
+      const weightSq = term.weight ** 2;
+      normSq += weightSq;
+      for (const { window, t } of term.hits) {
+        const score = scores.get(window) ?? { dot: 0, count: 0, t, distinctive: false };
+        score.dot += weightSq;
+        score.count++;
+        score.t = Math.min(score.t, t);
+        score.distinctive ||= word.length >= 3 && term.hits.length === 1;
+        scores.set(window, score);
+      }
+    }
+    let bestScore = 0;
+    let bestTime;
+    for (const [window, score] of scores) {
+      const cosine = score.dot / Math.sqrt(normSq * window.normSq);
+      const minScore = score.count >= 2 ? 0.22 : score.distinctive ? 0.34 : Infinity;
+      if (cosine >= minScore && (cosine > bestScore || (cosine === bestScore && score.t < bestTime))) {
+        bestScore = cosine;
+        bestTime = score.t;
+      }
+    }
+    return bestTime;
+  }
+
+  function showCaptionStatus() {
+    const element = player()?.querySelector(".ytdm-caption-status");
+    if (!element) return;
+    element.hidden = !S.matchCaptions;
+    const text = captionState?.status ?? "";
+    if (element.textContent !== text) element.textContent = text;
+  }
+
+  async function updateCaptionMatches(state, panelCues, signal) {
+    if (!state.index) {
+      state.status = "字幕・文字起こしを読み込み中…";
+      showCaptionStatus();
+      let cues = panelCues;
+      if (!state.waitingForPanel) {
+        try {
+          const fullCues = await fetchCaptionCues(state, signal);
+          if (fullCues.length) cues = fullCues;
+        } catch (error) {
+          signal.throwIfAborted();
+          console.debug("[YouTube Danmaku] 字幕を取得できませんでした", error.message);
+        }
+      }
+      signal.throwIfAborted();
+      if (!cues.length) {
+        state.waitingForPanel = true;
+        state.status = "字幕を取得できませんでした。概要欄に「文字起こしを表示」があれば開いてください。";
+        showCaptionStatus();
+        return;
+      }
+      state.waitingForPanel = false;
+      state.fromPanel = cues === panelCues;
+      const index = await buildCaptionIndex(cues, signal);
+      signal.throwIfAborted();
+      state.index = index;
+    }
+    state.status = "コメントと照合中…";
+    showCaptionStatus();
+    const previouslyMatched = state.matches.size;
+    // コメント取得中に配列が伸びても、前回の続きから照合する
+    for await (const comment of inBatches(comments.slice(state.processed), signal)) {
+      signal.throwIfAborted();
+      if (!TS_RE.test(comment.text) && !state.matches.has(comment.text)) {
+        const t = matchCaption(comment.text, state.index);
+        if (t !== undefined) state.matches.set(comment.text, t);
+      }
+      state.processed++;
+    }
+    if (state.matches.size !== previouslyMatched) {
+      layoutKey = "";
+      rebuild();
+    }
+    const source = state.fromPanel ? "読み込まれた文字起こし" : "字幕・文字起こし";
+    state.status = `${source}に合わせたコメント本文 ${state.matches.size} 件`;
+    showCaptionStatus();
+  }
+
+  function refreshCaptionMatching() {
+    const state = captionState;
+    showCaptionStatus();
+    if (!state) return;
+    if (!S.matchCaptions) {
+      state.controller?.abort();
+      state.controller = null;
+      state.waitingForPanel = false;
+      state.failed = false;
+      return;
+    }
+    if (state.controller || state.failed || (state.index && state.processed >= comments.length)) return;
+    const panelCues = state.index ? [] : readTranscriptPanel(state.id);
+    if (state.waitingForPanel && !panelCues.length) return;
+    const controller = new AbortController();
+    state.controller = controller;
+    updateCaptionMatches(state, panelCues, controller.signal).catch((error) => {
+      if (controller.signal.aborted) return;
+      console.warn("[YouTube Danmaku] 字幕との照合に失敗", error);
+      state.waitingForPanel = false;
+      state.failed = true;
+      state.status = "字幕との照合に失敗しました。";
+      showCaptionStatus();
+    }).finally(() => {
+      if (captionState !== state || state.controller !== controller) return;
+      state.controller = null;
+      if (!state.failed && !state.waitingForPanel && state.index && state.processed < comments.length) refreshCaptionMatching();
+    });
   }
 
   // ---- 表示時刻の決定 ----
@@ -327,9 +606,10 @@
    * @param {VideoComment[]} list 取得した親コメントと返信。
    * @param {number} duration 動画の長さ（秒）。
    * @param opts 表示設定。横切る時間（duration、秒）と本文の最大文字数（maxChars）を使う。
+   * @param {Map<string, number>} [matches] 字幕に一致したコメント本文と表示開始時刻。
    * @returns {TimedComment[]} 表示開始時刻の昇順のスケジュール。
    */
-  function buildSchedule(list, duration, opts) {
+  function buildSchedule(list, duration, opts, matches) {
     const clip = (s) => {
       s = s.replace(/\s+/g, " ").trim();
       return s.length > opts.maxChars ? s.slice(0, opts.maxChars) + "…" : s;
@@ -338,8 +618,11 @@
     for (const c of list) {
       const parts = splitByStamps(c.text);
       if (!parts.length) {
-        // タイムスタンプなし: 本文から決まる固定の位置へ散らす
-        out.push({ t: hash(c.text) * Math.max(0, duration - opts.duration), text: clip(c.text) });
+        const match = matches?.get(c.text);
+        const t = match >= 0 && match < duration
+          ? match
+          : hash(c.text) * Math.max(0, duration - opts.duration);
+        out.push({ t, text: clip(c.text) });
         continue;
       }
       for (const x of parts) out.push({ t: x.t, text: clip(x.text) });
@@ -371,7 +654,8 @@
     const v = video();
     if (!v || player()?.classList.contains("ad-showing")) return;
     // ライブ配信(duration=Infinity)は対象外
-    schedule = Number.isFinite(v.duration) ? buildSchedule(comments, v.duration, S) : [];
+    const matches = S.matchCaptions ? captionState?.matches : undefined;
+    schedule = Number.isFinite(v.duration) ? buildSchedule(comments, v.duration, S, matches) : [];
     cursor = lowerBound(lastT);
   }
 
@@ -441,7 +725,10 @@
   /** 再生時刻に合わせて弾幕を追加・移動・削除し、次の描画を予約する。 */
   function frame() {
     requestAnimationFrame(frame);
-    if (++frameNo % 60 === 0) setupPlayer(); // コントロールが作り直された場合にボタンを戻す
+    if (++frameNo % 60 === 0) {
+      setupPlayer(); // コントロールが作り直された場合にボタンを戻す
+      if (captionState?.waitingForPanel) refreshCaptionMatching();
+    }
     const v = video();
     const box = layer();
     if (!v || !box) return;
@@ -490,6 +777,7 @@
     document.querySelectorAll(".ytdm-btn").forEach((b) => b.setAttribute("aria-pressed", String(S.enabled)));
     applyStyle();
     rebuild();
+    refreshCaptionMatching();
   }
 
   /**
@@ -535,6 +823,14 @@
       inputs[key] = input;
       row.append(span, input);
       panel.append(row);
+      if (key === "matchCaptions") {
+        const status = document.createElement("p");
+        status.className = "ytdm-caption-status";
+        status.setAttribute("role", "status");
+        status.textContent = captionState?.status ?? "";
+        status.hidden = !S.matchCaptions;
+        panel.append(status);
+      }
     }
 
     const buttons = document.createElement("div");
@@ -638,6 +934,9 @@
   /** 動画切り替え時に前の弾幕を消し、現在の動画のコメントを順次読み込む。 */
   async function load() {
     const gen = ++loadGen;
+    captionState?.controller?.abort();
+    captionState = null;
+    showCaptionStatus();
     comments = [];
     schedule = [];
     clear();
@@ -645,11 +944,16 @@
     if (location.pathname !== "/watch" || !id) return;
     // プレイヤー生成待ち
     for (let i = 0; i < 50 && !setupPlayer(); i++) await new Promise((r) => setTimeout(r, 200));
+    if (gen !== loadGen) return;
+    const watchData = innertube({ videoId: id });
+    captionState = { id, watchData, matches: new Map(), processed: 0 };
+    refreshCaptionMatching();
     try {
-      for await (const list of fetchComments(id)) {
+      for await (const list of fetchComments(watchData)) {
         if (gen !== loadGen) return; // 別の動画へ移動済み
         comments = list;
         rebuild();
+        refreshCaptionMatching();
       }
     } catch (e) {
       console.warn("[YouTube Danmaku]", e);
